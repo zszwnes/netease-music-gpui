@@ -5,6 +5,7 @@ use gpui::*;
 use gpui_kit::base::input::{Input, InputEditorStyle, InputEvent, InputState};
 use gpui_kit::base::{ColorTokens, Root, Scrollbar, ScrollbarMode, Theme};
 
+#[cfg(target_os = "macos")]
 use super::hide_traffic_lights;
 use crate::desktop;
 use crate::models::Song;

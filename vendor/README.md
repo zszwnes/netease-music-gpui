@@ -2,7 +2,7 @@
 
 以下为 GPUI 补丁的准备及维护说明。
 
-这里只跟踪 `patches/` 下的补丁，不提交完整依赖源码。
+这里跟踪 `patches/` 下的补丁，以及 `gpui-pre-windows/` 这一份已打好补丁的源码（原因见下）。
 补丁从原 stash 的 GPUI 0.3.7 实验移植到当前使用的 **0.3.8**。
 
 - `gpui-image-transform-0.3.8.patch`：图片 GPU 旋转。
@@ -18,9 +18,16 @@ cargo run --locked
 
 准备脚本从 crates.io 下载固定版本的 `gpui-pre`、`gpui-pre-apple`、`gpui-pre-wgpu`，
 校验 SHA-256，并按文件名顺序使用 `git apply` 应用 `patches/` 下的全部补丁。
-生成的三个源码目录已加入 `.gitignore`；
+这三个生成的源码目录已加入 `.gitignore`；
 根目录 Cargo 的 `[patch.crates-io]` 使用这些本地包，使直接和间接依赖共用相同版本。
 原始发布包中的 Apache-2.0 许可证随源码保留。
+
+`gpui-pre-windows/` 是唯一随仓库提交的依赖源码。CI 的缓存键只看 `patches/` 的哈希，
+缓存命中时会跳过准备脚本，届时若该目录不存在，cargo 会因为 `[patch.crates-io]` 指向空目录
+而直接报 `patch location ... does not contain packages`。把这份已打好补丁的源码纳入版本控制后，
+无论缓存是否命中，Windows 构建都能拿到 `PrimitiveBatch::BackdropBlurs` 分支。
+内容来自 gpui-pre-windows 0.3.8 发布包外加一个补丁（见文件内注释），换行统一为 LF；
+升级 GPUI 时需要重新生成这一份，而不是再给它加 `.patch`。
 
 脚本可重复运行；版本与补丁未变时直接跳过。需要修改补丁时，应编辑 patch，
 不要只修改生成的源码，因为下一次准备会替换这些目录。
@@ -57,6 +64,7 @@ Metal 后端每帧把 drawable 拷进一张带 mip 链的纹理：
 - 需要 `layer.set_framebuffer_only(false)` 才能读取 drawable，这是该接口开启的。
 
 WGPU 后端目前忽略该批次（Windows/Linux 上不绘制模糊）；需要在其他平台使用时照样补一个实现。
+Windows 的 DirectX 后端同样跳过该批次（`vendor/gpui-pre-windows/src/directx_renderer.rs`）。
 
 升级 GPUI 时，更新准备脚本中的版本与发布包 SHA-256，并重新生成、验证 patch。
 如果上游提供同等接口，可删除补丁、准备脚本和 Cargo 中的路径覆盖。

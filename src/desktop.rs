@@ -6,8 +6,11 @@ use tray_icon::{
 };
 
 use crate::api::MusicApi;
+#[cfg(target_os = "macos")]
 use crate::models::PlayMode;
-use crate::playback::{PlaybackController, PlaybackEvent};
+use crate::playback::PlaybackController;
+#[cfg(target_os = "macos")]
+use crate::playback::PlaybackEvent;
 use crate::state::library::MusicLibrary;
 use crate::ui::shell::MainWindow;
 

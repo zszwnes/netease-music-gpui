@@ -14,7 +14,6 @@ CRATES = {
     "gpui-pre": "d7f0bc3ebba070f8981b3f8e905a12f47d27794a30d029e59cdb9edf7a4b3360",
     "gpui-pre-apple": "bfdd914311cd12894367c8b9908947bb0c27fd42f8b9a5ff7a0730551a83fa4c",
     "gpui-pre-wgpu": "439c5421cafe1a7cf68d0c0ae5cc82b26fad6b0e6345ac98d20acaf1f2463914",
-    "gpui-pre-windows": "371f9bb13f97e3bea2f8b8e5e81232bb74d735153c244ae67f7400e743925b1c",
 }
 
 # Markers that must exist after patching. git apply exits 0 even when it skips
@@ -22,7 +21,6 @@ CRATES = {
 # result is verified instead of trusted.
 EXPECTED = {
     "gpui-pre/src/scene.rs": "BackdropBlurs(",
-    "gpui-pre-windows/src/directx_renderer.rs": "PrimitiveBatch::BackdropBlurs(_blurs) => Ok(())",
 }
 
 
