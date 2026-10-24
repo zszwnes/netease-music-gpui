@@ -17,6 +17,24 @@ CRATES = {
     "gpui-pre-windows": "371f9bb13f97e3bea2f8b8e5e81232bb74d735153c244ae67f7400e743925b1c",
 }
 
+# Markers that must exist after patching. git apply exits 0 even when it skips
+# a patch whose target paths it considers outside the working directory, so the
+# result is verified instead of trusted.
+EXPECTED = {
+    "gpui-pre/src/scene.rs": "BackdropBlurs(",
+    "gpui-pre-windows/src/directx_renderer.rs": "PrimitiveBatch::BackdropBlurs(_blurs) => Ok(())",
+}
+
+
+def apply_patch(patch, staging):
+    command = ["git", "apply", str(patch)]
+    for arguments in (command + ["--check"], command):
+        result = subprocess.run(arguments, cwd=staging, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"git apply failed for {patch.name}:\n{result.stderr.strip()}")
+        if "Skipped patch" in result.stderr:
+            raise RuntimeError(f"git apply skipped {patch.name}:\n{result.stderr.strip()}")
+
 
 def main():
     root = Path(__file__).resolve().parents[1]
@@ -56,9 +74,16 @@ def main():
             # The Metal build script uses the sibling patched GPUI source instead.
             if name == "gpui-pre-apple":
                 shutil.rmtree(staging / "vendor" / name / "vendor")
+        # The staging tree sits inside this repository, and git apply ignores
+        # hunks whose paths fall outside the current directory. Turning the
+        # staging tree into its own repository keeps every patch path top-level.
+        subprocess.run(["git", "init", "-q"], cwd=staging, check=True)
         for patch in patches:
-            subprocess.run(["git", "apply", "--check", str(patch)], cwd=staging, check=True)
-            subprocess.run(["git", "apply", str(patch)], cwd=staging, check=True)
+            apply_patch(patch, staging)
+        for relative, needle in EXPECTED.items():
+            text = (staging / "vendor" / relative).read_text(encoding="utf-8")
+            if needle not in text:
+                raise RuntimeError(f"Patch was not applied to vendor/{relative}")
         for name in CRATES:
             destination = vendor / name
             if destination.exists():
