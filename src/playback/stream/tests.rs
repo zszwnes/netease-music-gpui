@@ -923,25 +923,22 @@ async fn hung_download_is_detected_as_stalled_before_it_ever_fails() {
 /// 而暂停时没人再提交需求。现在必须留下记录，供恢复播放时判断。
 #[tokio::test]
 async fn background_download_failure_is_recorded_without_interrupting_playback() {
-    let mut server = serve(wav(60), true, None, None).await;
+    // 用确定性的错误区间代替“断开服务器”：drop 监听任务只是尽力取消连接，
+    // 落到本机回环上的 body 可能已经在取消生效前整块写进缓冲，失败会退化成竞态。
+    let server = serve(
+        wav(60),
+        true,
+        Some(ServerFailure::WrongRange(16 * BLOCK_BYTES, Arc::new(AtomicBool::new(true)))),
+        None,
+    )
+    .await;
     let (audio, mut output) = open(&server).await;
     let mut buffer = [0.; 4800];
     for _ in 0..20 {
         output.write(&mut buffer, 1.);
     }
-    // 播放位置还在第 0 块，而下载已经跑到 4 MB 之外；那里的失败与播放无关。
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while server
-            .requests
-            .recv()
-            .await
-            .is_some_and(|offset| offset < 16 * BLOCK_BYTES)
-        {}
-    })
-    .await
-    .expect("下载应推进到 4 MB 之后");
-    drop(server);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // 播放位置还在第 0 块，而下载已经推进到 4 MB 之外的区间；那里的失败与播放无关。
+    tokio::time::timeout(Duration::from_secs(10), async {
         while !audio.download_failed() {
             assert!(audio.error().is_none(), "{:?}", audio.error());
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -951,6 +948,18 @@ async fn background_download_failure_is_recorded_without_interrupting_playback()
     .expect("后台下载失败必须留下记录，不能被静默吞掉");
     assert!(!audio.download_complete());
     assert!(audio.error().is_none(), "与播放位置无关的失败不应打断播放");
+    // 记录的是这一处确定性错误，而不是别的超时或断线。
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !audio
+            .cache
+            .failure()
+            .is_some_and(|message| message.contains("音频分段范围与请求不一致"))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("记录的失败原因必须是区间不一致");
 }
 
 #[tokio::test]
