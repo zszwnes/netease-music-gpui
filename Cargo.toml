@@ -67,3 +67,4 @@ codegen-units = 1
 gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
