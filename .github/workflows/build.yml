@@ -1,0 +1,268 @@
+name: build
+
+# 本仓库原本没有任何 CI。这份 workflow 用来验证「能否在 GitHub Actions 上编译本项目」，
+# 并顺带产出可分发包。放到 .github/workflows/build.yml 即可。
+#
+# 三条硬约束决定了步骤顺序，改之前务必先看：
+# 1. vendor/ncm-api-rs 是 git submodule，checkout 必须 submodules: recursive，
+#    否则 Cargo.toml 的 path 依赖不存在；
+# 2. vendor/gpui-pre / gpui-pre-apple / gpui-pre-wgpu 被 .gitignore 忽略，仓库里没有，
+#    必须先跑 scripts/prepare_gpui.py 从 crates.io 下载 0.3.8 并打补丁，
+#    否则 [patch.crates-io] 指向不存在的 path；
+# 3. prepare_gpui.py 内部用 git apply 打补丁，补丁里的 a/ 路径按仓库根解析，
+#    所以必须在仓库根运行；Windows runner 默认 core.autocrlf=true 会把 *.patch
+#    检出成 CRLF，导致 "patch does not apply"，因此 checkout 前先关掉转换。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # 快跑探针：只验证「下载 crate + 打补丁」，三平台各跑一遍，几分钟出结果，
+  # 免得等了半小时编译才发现补丁根本打不上。
+  prepare:
+    name: prepare gpui-pre (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Disable CRLF conversion (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 兜底：即使 core.autocrlf 没关掉，也把补丁统一成 LF。
+      # git apply 对 CRLF 的补丁会报 "patch does not apply"。
+      # 用 heredoc 而非 -c，避免三个平台 shell 的引号差异。
+      - name: Force LF in patches
+        shell: bash
+        run: |
+          python - <<'PYEOF'
+          import pathlib
+          for patch in pathlib.Path("vendor/patches").glob("*.patch"):
+              data = patch.read_bytes()
+              if b"\r\n" in data:
+                  patch.write_bytes(data.replace(b"\r\n", b"\n"))
+                  print("normalized", patch)
+          PYEOF
+
+      # 脚本内 urllib 没有重试，网络抖动会抛 IncompleteRead；重跑一次即可，
+      # 已成功的会走 .gpui-patch-id stamp 快路径直接 return。
+      - name: Download crates and apply patches
+        shell: bash
+        run: python scripts/prepare_gpui.py || python scripts/prepare_gpui.py
+
+      - name: Sanity check patched sources
+        shell: bash
+        run: |
+          test -f vendor/gpui-pre/src/scene.rs
+          test -f vendor/gpui-pre-apple/src/metal_renderer.rs
+          test -f vendor/gpui-pre-wgpu/src/wgpu_renderer.rs
+          grep -qE 'shaders\.(metallib|air)' vendor/gpui-pre-apple/build.rs
+
+  check:
+    name: check + test (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
+    steps:
+      - name: Disable CRLF conversion (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Windows runner 只有约 14G 空闲，gpui-pre + wgpu + windows-rs 的
+      # debug 产物容易打满，删掉用不到的预装 SDK 腾空间。
+      - name: Free disk space (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($p in @('C:\Program Files\dotnet', 'C:\Program Files\Android', 'C:\Program Files (x86)\Android')) {
+            if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
+          }
+
+      # tray-icon 0.26.1 声明 rust-version = 1.90，edition 2024 需要 >= 1.85。
+      # 仓库里没有 rust-toolchain.toml，用 stable。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # vendor/gpui-pre* 每次 CI 都要重新下载 + 打补丁，直接缓存起来。
+      # 注意 git apply 需要 .git，缓存只放 vendor 子目录，仓库仍是 checkout 出来的。
+      - name: Restore patched gpui-pre
+        id: gpui-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/gpui-pre
+            vendor/gpui-pre-apple
+            vendor/gpui-pre-wgpu
+            vendor/.gpui-patch-id
+          key: gpui-pre-0.3.8-${{ runner.os }}-${{ hashFiles('vendor/patches/*.patch') }}
+
+      # macOS：gpui-pre-apple/build.rs 会 `xcrun -sdk macosx metal` 编译 shaders.metal，
+      # 失败就 cargo::error 直接 exit(1)。Xcode 26 起 Metal toolchain 不再随 Xcode 预装，
+      # 缺了会报 "cannot execute tool 'metal' due to missing Metal Toolchain"，
+      # 需要 `xcodebuild -downloadComponent MetalToolchain` 单独拉（几百 MB）。
+      # 注意用 --version 探测而不是 xcrun -f：缺 toolchain 时 metal 这个壳还在，
+      # -f 能返回路径，但一执行就报错。
+      # 这一步不能加 cache-hit 条件：缓存的是打过补丁的源码，build.rs 里的
+      # metal 编译每次构建都会重跑，缺 toolchain 照样失败。
+      - name: Ensure Metal toolchain
+        if: runner.os == 'macOS'
+        run: |
+          if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            xcrun -sdk macosx metal --version
+            exit 0
+          fi
+          echo "Metal toolchain missing, downloading component..."
+          xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+
+      - name: Patch gpui-pre
+        if: steps.gpui-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: python scripts/prepare_gpui.py || python scripts/prepare_gpui.py
+
+      # 格式/lint 失败不等于编译失败，这里都标 continue-on-error，
+      # 保证「能不能编译」这个结论不被代码风格问题污染。
+      - name: cargo fmt --check
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+      # gpui-pre 等是 path 依赖，属于 dependency，clippy 不会 lint 它们。
+      - name: cargo clippy
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # AGENTS.md：普通测试不启动窗口、不需要外网和声卡；播放回归用本地 HTTP
+      # server + 内存生成 WAV + tests/fixtures；真实接口测试标了 #[ignore]。
+      - name: cargo test
+        run: cargo test --locked
+
+  package:
+    name: package (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
+    steps:
+      - name: Disable CRLF conversion (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Free disk space (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($p in @('C:\Program Files\dotnet', 'C:\Program Files\Android', 'C:\Program Files (x86)\Android')) {
+            if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - name: Restore patched gpui-pre
+        id: gpui-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/gpui-pre
+            vendor/gpui-pre-apple
+            vendor/gpui-pre-wgpu
+            vendor/.gpui-patch-id
+          key: gpui-pre-0.3.8-${{ runner.os }}-${{ hashFiles('vendor/patches/*.patch') }}
+
+      - name: Ensure Metal toolchain
+        if: runner.os == 'macOS'
+        run: |
+          if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            xcrun -sdk macosx metal --version
+            exit 0
+          fi
+          echo "Metal toolchain missing, downloading component..."
+          xcodebuild -downloadComponent MetalToolchain || sudo xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+
+      - name: Patch gpui-pre
+        if: steps.gpui-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: python scripts/prepare_gpui.py || python scripts/prepare_gpui.py
+
+      # 必须走 package.py：它先跑 prepare_gpui.py，再
+      # cargo build --locked --release --bin netease-music-gpui --target <host>，
+      # 最后把 assets/ 与 packaging/163Music.icns 组装进 bundle（macOS 还做
+      # ad-hoc codesign --sign -）。单独 cargo build --release 不复制资源。
+      # 产物在 target/<host>/release/，bundle 在 target/bundle/ 下。
+      - name: Build and assemble bundle
+        shell: bash
+        run: python scripts/package.py
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: netease-music-gpui-${{ matrix.name }}
+          path: |
+            target/bundle/netease-music-gpui/**
+            target/bundle/NetEase Music.app/**
+          if-no-files-found: error
+          compression-level: 6
